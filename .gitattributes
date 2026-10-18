@@ -1,0 +1,10 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ino text eol=lf
+*.c text eol=lf
+*.bat text eol=crlf
+*.png binary

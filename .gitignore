@@ -1,0 +1,54 @@
+# Python ve yerel gelistirme ortamlari
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+.codex/
+.agents/
+
+# Kisisel olcumler, disa aktarimlar ve yerel egitim dosyalari
+data/
+datasets/
+exports/
+models/
+local_only/
+*.csv
+*.tsv
+*.sqlite*
+*.db
+*.db-*
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.onnx
+docs/DOGRULAMA.md
+
+# Bilgisayara ozel ayarlar ve gizli bilgiler
+settings.json
+settings.tmp
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Firmware derleme ciktilari
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+arduniodenemesi/build*/
+arduniodenemesi/sketch_oct18a/
+*.bin
+*.elf
+*.map
+
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

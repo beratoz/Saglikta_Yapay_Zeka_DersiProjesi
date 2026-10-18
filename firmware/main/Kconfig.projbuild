@@ -1,0 +1,10 @@
+menu "PPG sensor wiring"
+    config PPG_SDA_GPIO
+        int "I2C SDA GPIO"
+        default 4
+        range 0 21
+    config PPG_SCL_GPIO
+        int "I2C SCL GPIO"
+        default 5
+        range 0 21
+endmenu
