@@ -33,8 +33,7 @@ Parmak → MAX30102 → I²C → ESP32-C3 → USB seri bağlantı → Python →
 
 I²C, ADC ve FIFO yapısı [MAX30102 veri sayfasında](https://www.analog.com/media/en/technical-documentation/data-sheets/max30102.pdf)
 açıklanır. Kullanılan GPIO pinleri ve sensörün ayrıntılı ayarları karttaki
-firmware'e bağlıdır. Önceki sürümün ESP-IDF ve Arduino kaynakları depodaki
-`firmware/` ve `arduniodenemesi/` klasörlerinde korunur.
+firmware'e bağlıdır. ESP-IDF kaynakları depodaki `firmware/` klasöründedir.
 
 ## 3. ESP32'den hangi veriler geliyor?
 

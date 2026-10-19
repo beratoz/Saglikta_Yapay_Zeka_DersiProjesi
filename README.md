@@ -17,7 +17,7 @@ yüklü olmalıdır. Uygulama firmware yüklemez veya sensör ayarlarını deği
 ## Bağlantı ve ölçüm
 
 1. ESP32'yi USB ile bağlayın; portu seçin, baud hızını 115200 bırakın ve Bağlan deyin.
-   Port başka bir uygulamada açıksa ESP-IDF/Arduino seri monitörünü kapatın.
+   Port başka bir uygulamada açıksa ESP-IDF seri monitörünü kapatın.
 2. IR ve RED akışını izleyin. Ham görünüm ADC değerlerini, nabız bileşeni
    0,5–4 Hz filtreli sinyali gösterir. Kanallar ayrı ölçeklerdedir.
 3. Aynı satırda Sabah / Öğle / Akşam bölümünü ve görev öncesi/sonrası aşamasını seçin;
@@ -90,8 +90,8 @@ Kötü sinyalden özellik uydurulmaz. Grafik filtresi ham kaydı değiştirmez.
 
 `main.py`: arayüz. `ppg.py`: seri bağlantı, sinyal analizi, CSV.
 `requirements.txt` ve `Baslat.bat`: çalıştırma. `kayitlar/`: yalnızca sizin CSV'leriniz.
-Önceki sürümdeki ESP-IDF (`firmware/`) ve Arduino (`arduniodenemesi/`) kaynakları
-da depoda korunur. Python arayüzü bunları otomatik derlemez veya karta yüklemez.
+ESP32 için ESP-IDF kaynakları `firmware/` klasöründe korunur. Python arayüzü
+bunları otomatik derlemez veya karta yüklemez. Arduino IDE gerekli değildir.
 
 Kişisel CSV/SQLite kayıtları, dışa aktarımlar, Python ortamları, yerel ayarlar,
 `.env` dosyaları ve derleme çıktıları `.gitignore` ile gönderim dışında tutulur.
