@@ -1,96 +1,104 @@
-# PPG Laboratuvarı
+# PPG ölçüm ve etiketleme
 
-MAX30102 ve ESP32-C3 kullanarak zihinsel yorgunluk araştırması için **PPG verisi toplama ve etiketleme** uygulaması. Türkçe Windows arayüzünün tamamı `main.py` içindedir. Bu sürümde model eğitimi ve yorgunluk tahmini bulunmaz.
+ESP32-C3 Super Mini ve MAX30102 ile kişisel araştırma verisi toplamak için
+yerel Python uygulaması. Koyu, masaüstü arayüz; canlı RED/IR, atımlar arası süre,
+etiketleme ve düzenlenebilir CSV kayıtları. Katılımcı bilgisi istenmez.
 
-## Klonla ve çalıştır
+## Başlatma
 
-**Gereken:** Windows 10/11, Python **3.11–3.14 / 64-bit** ve ilk kurulumda internet. Python 3.11 veya 3.12 önerilir. Python kurulurken **Add Python to PATH** seçeneğini işaretleyin.
+Windows'ta `Baslat.bat` dosyasını açın. Uygulama büyütülmüş normal pencereyle
+başlar. Mevcut `.venv` veya `miniconda3/envs/ppg_env` kullanılır. Bunlar yoksa
+Python 3.11+ ile yerel `.venv` oluşturulup requirements.txt kurulur.
 
-```powershell
-git clone https://github.com/beratoz/Saglikta_Yapay_Zeka_DersiProjesi.git
-cd Saglikta_Yapay_Zeka_DersiProjesi
-.\Baslat.bat
-```
+Elle: `python -m pip install -r requirements.txt`, ardından `python main.py`.
+ESP-IDF uygulamayı çalıştırmak için gerekli değildir; firmware karta önceden
+yüklü olmalıdır. Uygulama firmware yüklemez veya sensör ayarlarını değiştirmez.
 
-Dosya Gezgini'nden **Baslat.bat** dosyasına çift tıklamak da yeterlidir. İlk çalıştırmada gerekli paketler `.venv` ortamına kurulur. Sonraki açılışlarda tekrar kurulum yapılmaz. **Demo başlat** ile donanım olmadan denenebilir.
+## Bağlantı ve ölçüm
 
-Kurulumu ayrı yapmak için `Kurulum.bat` çalıştırın. Yerel `.venv` yoksa başlatıcı mevcut `miniconda3/envs/ppg_env` ortamını da kullanabilir; **Conda zorunlu değildir**.
+1. ESP32'yi USB ile bağlayın; portu seçin, baud hızını 115200 bırakın ve Bağlan deyin.
+   Port başka bir uygulamada açıksa ESP-IDF/Arduino seri monitörünü kapatın.
+2. IR ve RED akışını izleyin. Ham görünüm ADC değerlerini, nabız bileşeni
+   0,5–4 Hz filtreli sinyali gösterir. Kanallar ayrı ölçeklerdedir.
+3. Aynı satırda Sabah / Öğle / Akşam bölümünü ve görev öncesi/sonrası aşamasını seçin;
+   o aşamanın zihinsel yorgunluk puanını girin.
+   Diğer alanlar isteğe bağlıdır; bilinmeyen değerler boş kalır.
+4. Süreyi seçin, Kaydı başlat deyin. Süre dolunca kayıt durur. Etiketleri kontrol
+   edip CSV kaydet ile tamamlayın. Durdur ile kısmi kayıt da alınabilir.
+5. Görev sonrası ölçümde aynı çalışma açık kalır. Önce ve sonra puanlarını
+   doldurun. Başka bir görev oturumuna geçerken Yeni çalışma deyin.
+6. CSV kayıtları bölümünden bir satırı seçip Sinyali incele deyin. Etiketleri
+   düzenle, CSV içindeki etiketleri değiştirir; ham sinyali ve özellikleri korur.
 
-Elle kurulum:
+Zihinsel yorgunluk, uykululuk, stres, fiziksel yorgunluk ve görev zorluğu
+birbirinden ayrı 1–10 öz değerlendirmelerdir (1 çok düşük, 10 çok yüksek).
+Bu özel puanlar doğrulanmış klinik ölçekler olarak sunulmaz. Uyku süresi,
+çalışma süresi, son 4 saatte kafein, son 2 saatte egzersiz ve kısa not eklenebilir.
+Çalışma süresi aynı alandaki ayrı saat ve dakika kontrollerinden girilir. CSV'de
+eski kayıtlarla uyumlu olarak toplam dakika (`study_minutes`) tutulur. İki alan
+da boşsa süre bilinmiyor demektir; birini doldurmak diğerini görünür şekilde 0 yapar.
+Bu zaman pencereleri veri toplama tercihidir.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe main.py
-```
+### Seri veri biçimi
 
-## Kullanım
+`PPG,seq,device_ms,red,ir` — örnek: `PPG,237,2370,1266,1437`.
+COM7 üzerinden 115200 baud ile bu biçim gerçek karttan doğrulandı.
+Yeni arayüzün gerçek olay döngüsünde 18 saniyelik bağlantı kontrolünde 1.581
+örnek alındı; cihaz zamanından 100 Hz ve sıfır sıra/zaman kesintisi görüldü.
+Bu kontrol sırasında CSV kaydedilmedi; bu, PRV veya yorgunluk doğrulaması değildir.
+USB port numarası başka bilgisayarda veya USB girişinde değişebilir.
+Nominal 100 Hz akış beklenir. Zaman/örnek sırası kesintileri korunur; filtre
+kesintinin üzerinden geçirilmez, grafikte boşluk bırakılır.
 
-1. Cihazın COM portunu seçip **Bağlan** deyin veya **Demo başlat** kullanın.
-2. Yorgunluk puanını seçin; uyku, çalışma süresi ve görev zorluğunu girin. Diğer alanlar **Ek bilgiler** altında açılır.
-3. Aynı çalışma oturumunun önce ve sonrası için aynı eşleştirme kodunu kullanın.
-4. Süreyi seçip **Kaydı başlat**, ölçüm sonunda **Kaydı kaydet** deyin.
-5. **Kayıtlar** sekmesindeki tarihli kartlardan sinyali inceleyin, etiketleri düzenleyin veya ham CSV alın. İki kartı işaretleyerek karşılaştırın. Etiketli özellikler ayrıca CSV olarak dışa aktarılabilir.
+## CSV biçimi
 
-Kayıt klasörü üstte görünür; **Klasörü aç** ve **Değiştir** düğmeleriyle yönetilir. Klasör değiştirmek eski kayıtları taşımaz. Varsayılan `data` klasöründe ham sinyaller CSV, etiketler ve özetler SQLite olarak tutulur. Yedeklemek için klasörün tamamını kopyalayın. Veriler buluta gönderilmez.
+Her ölçüm `kayitlar/YYYYMMDD_HHMMSS_kod.csv` olarak **tek dosyada** saklanır.
+SQLite veya bulut yoktur. UTF-8 BOM ile Türkçe metinler korunur.
 
-![Canlı ölçüm — sentetik demo verisi](docs/arayuz.png)
+- Ham: seq, device_ms, elapsed_s, red, ir.
+- Atımlar: peak, ibi_ms, ibi_accepted. IBI yalnızca atım bulunan satırlarda doludur;
+  kabul edilip edilmediği ayrıca yazılır. Diğer satırlarda boş olması normaldir.
+- Etiketler: day_period (morning/noon/evening), phase (before/after), fatigue_before, fatigue_after, mental_fatigue, sleep_hours,
+  sleepiness, stress, physical_fatigue, task_difficulty, study_minutes, caffeine,
+  exercise, note. mental_fatigue seçilen aşamanın puanıdır.
+  Eski CSV'lerde gün bölümü yoksa otomatik bir bölüm atanmaz; düzenleme sırasında seçilebilir.
+- Otomatik: record_id, task_id, created_at, label_time, labels_updated_at,
+  source, baud_rate, sample_rate_hz, duration_s, sample_count, missing_samples,
+  discontinuities, quality, bpm, prv_rmssd_ms, prv_sdnn_ms, analysis_status,
+  requested_duration_s, complete.
 
-![Kayıt kartları — sentetik demo verisi](docs/kayitlar.png)
+Etiketler ve kayıt özeti her örnek satırında tekrar edilir; böylece dosya kendi
+başına kullanılabilir. Kaynak DEMO ise sentetik veridir; gerçek verilerle eğitime
+karıştırılmamalıdır. Görev öncesi ve sonrası farklı CSV dosyalarıdır ve ortak
+task_id ile ilişkilendirilir. CSV klasörünün tamamını kopyalamak yedek için yeterlidir.
 
-## Donanım ve karta yükleme
+Ölçüm tarihi/saati bilgisayardan, örnek zamanları ESP32'den alınır.
+sample_rate_hz cihaz zaman damgalarından tahmindir; bağımsız saat doğrulaması değildir.
+Eksik değer boş hücredir; 0 veya hayır yapılmaz. Etiket düzenleme geçici dosya
+tamamlandıktan sonra CSV'yi değiştirir. Excel dosyayı kilitlerse eski dosya korunur.
 
-USB'yi çıkararak, **3.3 V uyumlu MAX30102 breakout modülünde** şu bağlantıları yapın:
+## Hesaplamalar ve sınırlar
 
-| ESP32-C3 Super Mini | MAX30102 |
-|---|---|
-| 3V3 | 3.3 V uyumlu VIN / VCC |
-| GND | GND |
-| GPIO4 | SDA |
-| GPIO5 | SCL |
+Nabız için en az 15 saniye, RMSSD/SDNN için en az 60 saniye kesintisiz ve
+kabul edilmiş atım dizisi gerekir. Bunlar PPG tabanlı **PRV** özellikleridir;
+EKG tabanlı HRV ile eşdeğer kabul edilmez. Kalite yüzdesi basit bir atım düzenliliği
+kontrolüdür; klinik doğrulama değildir. Uygulama zihinsel yorgunluğu tahmin etmez,
+SpO₂ üretmez. Yorgunluk puanı modelin hedef etiketidir; nabız/PRV model girdileridir.
+Kötü sinyalden özellik uydurulmaz. Grafik filtresi ham kaydı değiştirmez.
 
-INT bağlantısı gerekmez. Modülün besleme uyumluluğunu ve pin etiketlerini kontrol edin.
+## Dosyalar ve test
 
-**Arduino IDE 2 ile:** Espressif Systems'ın `esp32` kart paketini kurup `arduniodenemesi/ppg_max30102/ppg_max30102.ino` dosyasını açın. Ek sensör kütüphanesi gerekmez.
+`main.py`: arayüz. `ppg.py`: seri bağlantı, sinyal analizi, CSV.
+`requirements.txt` ve `Baslat.bat`: çalıştırma. `kayitlar/`: yalnızca sizin CSV'leriniz.
+Önceki sürümdeki ESP-IDF (`firmware/`) ve Arduino (`arduniodenemesi/`) kaynakları
+da depoda korunur. Python arayüzü bunları otomatik derlemez veya karta yüklemez.
 
-| Ayar | Değer |
-|---|---|
-| Board | ESP32C3 Dev Module |
-| USB CDC On Boot | Enabled |
-| Flash Mode / Frequency / Size | DIO / 40 MHz / 4 MB |
-| Upload Speed | 115200 |
-| Port | Kendi cihazınızın COM portu |
+Kişisel CSV/SQLite kayıtları, dışa aktarımlar, Python ortamları, yerel ayarlar,
+`.env` dosyaları ve derleme çıktıları `.gitignore` ile gönderim dışında tutulur.
+`docs/` içindeki önizlemeler testlerin ürettiği sentetik verilerdir.
 
-Yükleme sırasında Python uygulamasının bağlantısı ve Arduino Seri Monitör kapalı olmalı. Yükleme karttaki mevcut programı değiştirir. Kart sürekli bağlanıp kopuyorsa USB'yi çıkarın; BOOT'a basılı tutarak USB'yi takın ve 5 saniye sonra BOOT'u bırakın. Yüklemeden sonra gerekirse yalnızca RESET'e basın.
+Testler: `python -m unittest discover -s tests -p test_ppg.py` ve
+`python tests/gui_smoke.py`. Önizleme için GUI testine `--screenshots` eklenebilir.
+Testler geçici klasörde sentetik veri kullanır; kişisel kayıtlara dokunmaz.
 
-**ESP-IDF alternatifi:** `firmware` klasörü ESP-IDF 5.3+ projesidir:
-
-```powershell
-cd firmware
-idf.py set-target esp32c3
-idf.py build
-idf.py -p COM7 flash
-```
-
-COM7 yerine kendi portunuzu yazın. Arduino sürümü ESP32-C3 / 4 MB kartla gerçek donanımda denendi; ESP-IDF sürümü ayrıca doğrulanmadı. İki sürüm aynı seri protokolünü kullanır; yalnızca birini yüklemeniz yeterlidir.
-
-Seri veri biçimi: `PPG,seq,device_ms,red,ir`, 115200 baud, nominal 100 Hz. Zaman damgası sensörün nominal örnek saatinden türetilir; bağımsız saat ölçümü değildir. FIFO/I²C kesintileri bildirilir ve sıra boşluğu bırakılır.
-
-## Etiketler ve analiz
-
-Ana alanlar: ölçüm türü, zihinsel yorgunluk (1–10), son gece uyku süresi, çalışma süresi, görev zorluğu ve eşleştirme kodu. Ek alanlar: ders/görev, algılanan stres, duruş, dinlenme süresi, yakın zamanda kafein/egzersiz ve not. Bilinmeyen alanlar boş bırakılır; otomatik olarak “hayır” sayılmaz. Tarih, saat, süre ve veri kaynağı otomatik kaydedilir.
-
-Yorgunluk puanı kişisel pilot etiketidir; doğrulanmış bir klinik ölçek değildir. Alanlar, [HRV ölçüm önerileri](https://pmc.ncbi.nlm.nih.gov/articles/PMC5316555/) ve [zihinsel yorgunluk araştırmalarındaki](https://www.frontiersin.org/journals/human-neuroscience/articles/10.3389/fnhum.2021.733426/full) ölçüm bağlamı dikkate alınarak seçildi. Kafein/egzersiz zaman pencereleri pratik kayıt tercihleridir.
-
-BPM için en az 15 saniye veri gerekir; canlı nabız son 20 saniyeden hesaplanır. RMSSD/SDNN için en az 60 saniye kesintisiz ve kabul edilmiş sinyal gerekir. Araştırma kaydı için 5 dakika seçilebilir. Kalite göstergesi sezgiseldir. PPG tabanlı PRV, EKG tabanlı HRV ile eşdeğer değildir; bu uygulama tıbbi teşhis aracı değildir.
-
-## Testler
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_core.py
-.\.venv\Scripts\python.exe tests/gui_smoke.py
-```
-
-Testler sentetik sinyal ve geçici kayıt klasörleri kullanır. Donanım gerekmez; gerçek ölçümlere dokunmaz. Önizlemeleri yeniden üretmek için GUI testine `--screenshots` ekleyin. GitHub Actions aynı testleri Windows/Python 3.11 üzerinde çalıştırır.
-
-`.gitignore`; kişisel ölçümleri, dışa aktarımları, yerel ayarları, Python ortamlarını ve derleme çıktılarını gönderim dışında tutar. Kayıt klasörünü başka bir konuma taşırsanız o konumu da Git'e eklemeyin.
+![Canlı ekran — sentetik örnek](docs/canli.png)

@@ -1,5 +1,5 @@
 PySide6>=6.9,<7
 pyqtgraph>=0.13.7,<0.15
-pyserial>=3.5,<4
 numpy>=2.2,<3
-scipy==1.17.1
+scipy>=1.15,<2
+pyserial>=3.5,<4

@@ -1,19 +1,8 @@
-# Python ve yerel gelistirme ortamlari
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.vscode/
-.idea/
-.codex/
-.agents/
-
-# Kisisel olcumler, disa aktarimlar ve yerel egitim dosyalari
+# Kişisel ölçümler ve dışa aktarımlar
+kayitlar/
 data/
 datasets/
 exports/
-models/
 local_only/
 *.csv
 *.tsv
@@ -25,30 +14,49 @@ local_only/
 *.npz
 *.pkl
 *.joblib
+models/
 *.onnx
-docs/DOGRULAMA.md
 
-# Bilgisayara ozel ayarlar ve gizli bilgiler
-settings.json
-settings.tmp
+# Python ortamları, önbellekler ve araç ayarları
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# Yerel ayarlar ve gizli bilgiler
 .env
 .env.*
 !.env.example
+settings.json
+settings.tmp
 *.pem
 *.key
+*.pfx
+*.p12
+credentials*.json
+secrets*.json
 
-# Firmware derleme ciktilari
+# Derleme çıktıları ve geçici dosyalar
 firmware/build/
 firmware/sdkconfig
 firmware/sdkconfig.old
 firmware/managed_components/
 arduniodenemesi/build*/
-arduniodenemesi/sketch_oct18a/
 *.bin
 *.elf
 *.map
-
 *.log
 *.tmp
+*.bak
+*.swp
 .DS_Store
 Thumbs.db

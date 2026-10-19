@@ -1,521 +1,607 @@
-"""PPG veri toplama uygulamasi: python main.py"""
-import csv
-import json
-import math
-import random
-import shutil
-import sqlite3
+"""Run with: python main.py"""
 import sys
 import time
 import uuid
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-import serial
 from serial.tools import list_ports
-from scipy.signal import butter, sosfiltfilt, find_peaks
-from PySide6.QtCore import QThread, QTimer, Signal, QUrl, Qt
-from PySide6.QtGui import QFontDatabase, QDesktopServices
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QTabWidget, QGroupBox, QFormLayout,
-    QDoubleSpinBox, QLineEdit, QCheckBox, QProgressBar, QMessageBox,
-    QFileDialog, QScrollArea, QGridLayout, QFrame, QDialog, QDialogButtonBox,
+    QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
+    QDoubleSpinBox, QSpinBox, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QMessageBox, QDialog, QDialogButtonBox, QProgressBar, QLineEdit,
 )
+from ppg import CsvStore, Acquisition, LABEL_KEYS, analyze, signal_data, now
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = ROOT / "settings.json"
-
-
-class Storage:
-    def __init__(self, root=None):
-        self.root = Path(root) if root else ROOT / 'data'
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.root / 'sessions.sqlite3')
-        self.db.execute('''CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY, created TEXT, source TEXT, labels TEXT,
-            features TEXT, samples INTEGER, file TEXT)''')
-        self.db.commit()
-
-    def save(self, samples, labels, features, source, created=None):
-        sid = uuid.uuid4().hex[:12]
-        created = created or datetime.now().astimezone().isoformat(timespec='seconds')
-        path = self.root / f'{sid}.csv'
-        temp = path.with_suffix('.tmp')
-        try:
-            with temp.open('w', newline='', encoding='utf-8-sig') as f:
-                w = csv.writer(f)
-                w.writerow(['seq', 'device_ms', 'red', 'ir'])
-                w.writerows(samples)
-            temp.replace(path)
-            self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?)',
-                            (sid, created, source, json.dumps(labels, ensure_ascii=False),
-                             json.dumps(features, ensure_ascii=False), len(samples), path.name))
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            temp.unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
-            raise
-        return sid
-
-    def sessions(self):
-        self.db.row_factory = sqlite3.Row
-        return [dict(r) for r in self.db.execute('SELECT * FROM sessions ORDER BY created DESC')]
-
-    def update_labels(self, sid, labels):
-        with self.db:
-            self.db.execute('UPDATE sessions SET labels=? WHERE id=?',
-                            (json.dumps(labels, ensure_ascii=False), sid))
-
-    def read(self, row):
-        with (self.root / row['file']).open(encoding='utf-8-sig', newline='') as f:
-            return [tuple(map(int, r)) for r in list(csv.reader(f))[1:]]
-
-    def export_dataset(self, path):
-        rows = []
-        for r in self.sessions():
-            rows.append(dict(session_id=r['id'], created=r['created'], source=r['source'],
-                             **json.loads(r['labels']), **json.loads(r['features'])))
-        if not rows:
-            raise ValueError('Henüz kayıt yok.')
-        columns = list(dict.fromkeys(k for r in rows for k in r))
-        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-            w = csv.DictWriter(f, fieldnames=columns)
-            w.writeheader()
-            w.writerows(rows)
-
-
-def analyze(samples):
-    """Exploratory PRV estimates. Never interpolate missing beats silently."""
-    empty = dict(bpm=None, rmssd_ms=None, sdnn_ms=None, quality=0,
-                 status="En az 15 saniye sinyal bekleniyor", duration_s=0, gaps=0)
-    if len(samples) < 2:
-        return empty
-    t = np.array([s[1] for s in samples], dtype=float) / 1000
-    x = np.array([s[3] for s in samples], dtype=float)
-    dt = np.diff(t)
-    duration = t[-1] - t[0] + (np.median(dt) if np.all(dt > 0) else 0)
-    gaps = sum(b[0] != a[0] + 1 for a, b in zip(samples, samples[1:]))
-    empty.update(duration_s=round(duration, 2), gaps=int(gaps))
-    if duration < 15 or np.any(dt <= 0):
-        return empty
-    fs = 1 / np.median(dt)
-    if fs < 20 or fs > 500 or np.max(dt) > .05 or gaps:
-        return dict(empty, status="Örnek kaybı / zamanlama sorunu")
-    if np.mean(x) < 1000 or np.any(x >= 262140):
-        return dict(empty, status="Parmak teması yok veya sinyal doygun")
-    y = sosfiltfilt(butter(3, [.5, 4], fs=fs, btype="bandpass", output="sos"), x)
-    amplitude = np.std(y)
-    if amplitude < 10:
-        return dict(empty, status="Sinyal genliği yetersiz")
-    peaks, _ = find_peaks(y, distance=int(fs * .33), prominence=amplitude * .6)
-    intervals = np.diff(t[peaks]) * 1000
-    if len(intervals) < 10:
-        return dict(empty, status="Yeterli atım bulunamadı")
-    valid = (intervals > 333) & (intervals < 1500)
-    median = np.median(intervals)
-    valid &= np.abs(intervals - median) < median * .25
-    fraction = np.mean(valid)
-    quality = int(100 * fraction)
-    result = dict(empty, quality=quality, status="Kullanılabilir (sezgisel)" if fraction >= .9 else "Hareket / düzensiz atım; yeniden ölçün")
-    if fraction < .9:
-        return result
-    result['bpm'] = round(60000 / np.mean(intervals[valid]), 1)
-    # PRV is reported only for >=60 s and an entirely accepted beat series.
-    if duration >= 60 and np.all(valid):
-        result['rmssd_ms'] = round(float(np.sqrt(np.mean(np.diff(intervals) ** 2))), 2)
-        result['sdnn_ms'] = round(float(np.std(intervals, ddof=1)), 2)
-    return result
-
-
-def analyze_live(samples):
-    result = analyze(samples[-2000:])
-    if result['bpm'] is not None and len(samples) >= 6000:
-        full = analyze(samples)
-        result['rmssd_ms'] = full['rmssd_ms']
-        result['sdnn_ms'] = full['sdnn_ms']
-    return result
-
-
-def parse_line(line):
-    parts = line.strip().split(',')
-    if len(parts) != 5 or parts[0] != 'PPG':
-        return None
-    seq, ms, red, ir = map(int, parts[1:])
-    if min(seq, ms, red, ir) < 0 or max(red, ir) > 262143:
-        raise ValueError('Veri aralık dışında')
-    return seq, ms, red, ir
-
-
-class Acquisition(QThread):
-    batch = Signal(list)
-    message = Signal(str)
-
-    def __init__(self, port=None):
-        super().__init__()
-        self.port = port
-
-    def run(self):
-        connection = None
-        buffer = []
-        last_emit = time.monotonic()
-        last_data = last_emit
-        last_warning = last_emit
-        streaming = False
-        seq = 0
-        start = last_emit
-        try:
-            if self.port:
-                connection = serial.Serial(baudrate=115200, timeout=.1)
-                connection.port = self.port
-                connection.rts = False
-                connection.dtr = True
-                connection.open()
-                self.message.emit(f'{self.port} açık — PPG verisi bekleniyor')
-            else:
-                self.message.emit('DEMO — sentetik sinyal, gerçek ölçüm değil')
-            while not self.isInterruptionRequested():
-                if connection:
-                    raw = connection.readline(256)
-                    try:
-                        sample = parse_line(raw.decode('ascii', errors='replace'))
-                    except ValueError:
-                        sample = None
-                    if raw.startswith(b'ERR,'):
-                        self.message.emit(raw.decode('ascii', errors='replace').strip())
-                    if sample:
-                        if not streaming:
-                            self.message.emit(f'{self.port} • Canlı veri alınıyor')
-                            streaming = True
-                        buffer.append(sample)
-                        last_data = time.monotonic()
-                else:
-                    target = int((time.monotonic() - start) * 100)
-                    while seq < target:
-                        t = seq / 100
-                        pulse = math.sin(2 * math.pi * 1.2 * t) + .25 * math.sin(4 * math.pi * 1.2 * t)
-                        buffer.append((seq, seq * 10, int(65000 + 1000 * pulse + random.gauss(0, 25)),
-                                       int(95000 + 1800 * pulse + random.gauss(0, 35))))
-                        seq += 1
-                    self.msleep(10)
-                now = time.monotonic()
-                if buffer and now - last_emit >= .05:
-                    self.batch.emit(buffer)
-                    buffer = []
-                    last_emit = now
-                if connection and now - last_data > 3 and now - last_warning > 3:
-                    streaming = False
-                    self.message.emit('3 saniyedir geçerli PPG verisi yok. Firmware / sensör bağlantısını kontrol edin.')
-                    last_warning = now
-        except (serial.SerialException, OSError) as e:
-            self.message.emit(f'Bağlantı hatası: {e}')
-        finally:
-            if buffer:
-                self.batch.emit(buffer)
-            if connection:
-                connection.close()
-
-
+DAY_PERIODS = [('Sabah', 'morning'), ('Öğle', 'noon'), ('Akşam', 'evening')]
 STYLE = '''
-QWidget { background:#101723; color:#e3eaf3; font-family:'Segoe UI'; font-size:13px; }
-QMainWindow { background:#101723; }
-QLabel#title { font-size:29px; font-weight:700; }
-QLabel#subtitle { color:#93a5bd; }
-QGroupBox { border:1px solid #2b3a50; border-radius:10px; margin-top:14px; padding:15px 10px 10px; font-weight:600; }
-QGroupBox::title { subcontrol-origin:margin; left:14px; padding:0 5px; color:#90a8c7; }
-QPushButton { background:#24344c; border:1px solid #354c69; border-radius:7px; padding:9px 14px; }
-QPushButton:hover { background:#334b6c; }
-QPushButton:disabled { color:#627084; background:#192332; }
-QPushButton#primary { background:#137d72; border:1px solid #20af9e; font-weight:700; }
-QLineEdit,QComboBox,QSpinBox,QDoubleSpinBox { background:#182436; padding:7px; border:1px solid #34465f; border-radius:5px; }
+QWidget { color:#e0e6ea; font-family:'Segoe UI'; font-size:12px; }
+QMainWindow, QWidget#workspace { background:#101519; }
+QLabel { background:transparent; }
+QLabel#brand { font-size:16px; font-weight:600; color:#eff4f6; padding-right:18px; }
+QLabel#muted { color:#9eafb9; font-size:11px; }
+QLabel#heading { font-size:13px; font-weight:600; color:#edf2f4; }
+QLabel#value { font-family:'Consolas'; font-size:26px; font-weight:600; }
+QLabel#status { color:#9bd3c5; }
+QLabel#error { color:#f0a396; }
+QFrame#panel { background:#181f25; border:1px solid #303b44; border-radius:4px; }
+QFrame#metric { background:#181f25; border:1px solid #303b44; border-radius:4px; }
+QPushButton { background:#222d35; border:1px solid #41505c; padding:6px 10px; border-radius:3px; }
+QPushButton:hover { background:#2c3943; border-color:#738894; }
+QPushButton:pressed, QPushButton:checked { background:#354c52; }
+QPushButton#primary { background:#2b6963; border-color:#5a9e91; color:#f1faf7; }
+QPushButton#danger { color:#edb8ae; }
+QPushButton:disabled { color:#74818c; background:#1b242b; border-color:#303b44; }
+QPushButton:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border:2px solid #83c9ba; }
+QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit, QPlainTextEdit { background:#11191f; border:1px solid #44515b; padding:5px 7px; border-radius:3px; selection-background-color:#376a67; }
+QComboBox { padding-right:22px; }
+QComboBox::drop-down { border:0; width:20px; }
+QComboBox QAbstractItemView { background:#1c2730; color:#e0e6ea; selection-background-color:#315854; }
 QTabWidget::pane { border:0; }
-QTabBar::tab { padding:12px 22px; background:#182436; margin-right:5px; }
-QTabBar::tab:selected { color:#5ce2cb; background:#24344c; }
-QProgressBar { border:0; background:#24344c; border-radius:5px; text-align:center; min-height:22px; }
-QProgressBar::chunk { background:#168d80; border-radius:5px; }
-QCheckBox::indicator { width:14px; height:14px; border:1px solid #627b9c; border-radius:3px; }
-QCheckBox::indicator:checked { background:#20af9e; }
-QFrame#card { background:#182436; border:1px solid #34465f; border-radius:10px; }
-QFrame#card QLabel, QFrame#card QCheckBox { background:transparent; }
-QFrame#card QPushButton { padding:7px; }
+QTabBar::tab { background:transparent; color:#a0b0bb; padding:10px 18px; border-bottom:2px solid transparent; }
+QTabBar::tab:selected { color:#d8eee8; border-bottom:2px solid #7bc4b2; }
+QTabBar::tab:focus { border:1px solid #83c9ba; }
+QTableWidget { background:#151d23; alternate-background-color:#1b252c; selection-background-color:#2a454b; selection-color:#edf6f4; border:1px solid #303b44; gridline-color:#303b44; }
+QTableWidget::item { padding:8px; }
+QHeaderView::section { background:#222d35; color:#b7c7cf; font-size:11px; padding:9px; border:0; border-bottom:1px solid #44515b; }
+QProgressBar { background:#26353c; border:0; min-height:4px; max-height:4px; }
+QProgressBar::chunk { background:#7bc4b2; }
+QDialog { background:#181f25; }
+QToolTip { background:#283a43; color:#edf6f4; border:1px solid #607681; padding:7px; }
 '''
 
 
-def button(text, callback, primary=False):
-    b = QPushButton(text)
-    b.clicked.connect(callback)
-    if primary:
-        b.setObjectName('primary')
-    return b
+def label(text, role=None, wrap=False):
+    widget = QLabel(text)
+    if role:
+        widget.setObjectName(role)
+    widget.setWordWrap(wrap)
+    return widget
 
 
-class LabelForm(QWidget):
-    """Aynı form yeni ölçümlerde ve kayıt düzenlemede kullanılır."""
+def button(text, callback, role=None):
+    widget = QPushButton(text)
+    widget.clicked.connect(callback)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    if role:
+        widget.setObjectName(role)
+    return widget
 
-    def __init__(self, values=None):
+
+def frame():
+    widget = QFrame()
+    widget.setObjectName('panel')
+    return widget
+
+
+def display(value, suffix=''):
+    return f'{value}{suffix}' if value is not None and value != '' else '—'
+
+
+def measurement_name(row, full=False):
+    period = dict((value, text) for text, value in DAY_PERIODS).get(row.get('day_period'), '')
+    phase = ('Görev öncesi' if row['phase'] == 'before' else 'Görev sonrası') if full else ('Önce' if row['phase'] == 'before' else 'Sonra')
+    return f'{period} · {phase}' if period else phase
+
+
+class StudyDuration(QWidget):
+    """Keep CSV compatibility: two visible controls, one total-minute value."""
+    def __init__(self, minutes=None):
         super().__init__()
-        self.original = values or {}
-        self.fields = {}
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        basic = QFormLayout()
-        layout.addLayout(basic)
-
-        def choice(form, key, title, items, default=None):
-            widget = QComboBox()
-            for text, value in items:
-                widget.addItem(text, value)
-            widget.setCurrentIndex(widget.findData(self.original.get(key, default)))
-            widget.setPlaceholderText('Seçin')
-            self.fields[key] = widget
-            form.addRow(title, widget)
-
-        def number(form, key, title, limit, suffix):
-            widget = QDoubleSpinBox()
+        box = QHBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        self.hours, self.minutes = QSpinBox(), QSpinBox()
+        for widget, limit, suffix, name in [(self.hours, 24, ' sa', 'Çalışma süresi saat'),
+                                             (self.minutes, 59, ' dk', 'Çalışma süresi dakika')]:
             widget.setRange(-1, limit)
-            widget.setDecimals(1 if key == 'sleep_hours' else 0)
+            widget.setSpecialValueText('—')
+            widget.setSuffix(suffix)
+            widget.setAccessibleName(name)
+            widget.setValue(-1)
+            box.addWidget(widget, 1)
+        if minutes not in (None, ''):
+            total = max(0, min(1440, int(float(minutes))))
+            self.hours.setValue(total // 60)
+            self.minutes.setValue(total % 60)
+        self.hours.valueChanged.connect(lambda _: self.sync(self.hours))
+        self.minutes.valueChanged.connect(lambda _: self.sync(self.minutes))
+        self.sync(None)
+
+    def sync(self, changed):
+        self.hours.blockSignals(True)
+        self.minutes.blockSignals(True)
+        if changed is not None:
+            other = self.minutes if changed is self.hours else self.hours
+            if changed.value() < 0:
+                other.setValue(-1)
+            elif other.value() < 0:
+                other.setValue(0)
+        self.minutes.setMaximum(0 if self.hours.value() == 24 else 59)
+        self.hours.blockSignals(False)
+        self.minutes.blockSignals(False)
+
+    def value(self):
+        return None if self.hours.value() < 0 else self.hours.value() * 60 + self.minutes.value()
+
+
+class Labels(QWidget):
+    def __init__(self, values=None, parent=None):
+        super().__init__(parent)
+        self.original = dict(values or {})
+        self.task_id = self.original.get('task_id') or uuid.uuid4().hex[:10]
+        self.fields = {}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+        phase_row = QHBoxLayout()
+        phase_row.addWidget(label('Ölçüm', 'muted'))
+        period = QComboBox()
+        period.addItem('Seçin', None)
+        for text, value in DAY_PERIODS:
+            period.addItem(text, value)
+        period.setCurrentIndex(max(0, period.findData(self.original.get('day_period'))))
+        period.setAccessibleName('Günün bölümü')
+        period.setToolTip('Sabah, öğle veya akşam ölçümü')
+        self.fields['day_period'] = period
+        phase_row.addWidget(period, 1)
+        phase = QComboBox()
+        phase.addItem('Görev öncesi', 'before')
+        phase.addItem('Görev sonrası', 'after')
+        phase.setCurrentIndex(max(0, phase.findData(self.original.get('phase', 'before'))))
+        phase.setAccessibleName('Ölçüm aşaması')
+        self.fields['phase'] = phase
+        phase_row.addWidget(phase, 2)
+        root.addLayout(phase_row)
+
+        def rating(key, title, hint=None):
+            widget = QComboBox()
+            widget.addItem('Belirtilmedi', None)
+            for i in range(1, 11):
+                widget.addItem(str(i), i)
+            value = self.original.get(key)
+            widget.setCurrentIndex(widget.findData(int(float(value))) if value not in (None, '') else 0)
+            widget.setAccessibleName(title)
+            widget.setToolTip(hint or '1 çok düşük · 10 çok yüksek')
+            self.fields[key] = widget
+            return widget
+
+        def number(key, title, maximum, suffix, decimals=0):
+            widget = QDoubleSpinBox()
+            widget.setRange(-1, maximum)
+            widget.setDecimals(decimals)
             widget.setSpecialValueText('Belirtilmedi')
             widget.setSuffix(suffix)
             value = self.original.get(key)
-            widget.setValue(value if value is not None else -1)
+            widget.setValue(float(value) if value not in (None, '') else -1)
+            widget.setAccessibleName(title)
             self.fields[key] = widget
-            form.addRow(title, widget)
+            return widget
 
-        def text(form, key, title, default=''):
-            widget = QLineEdit(str(self.original.get(key) or default))
+        def pair(first, second):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            for caption, widget in (first, second):
+                box = QVBoxLayout()
+                box.setSpacing(3)
+                caption_label = label(caption, 'muted')
+                caption_label.setBuddy(widget)
+                box.addWidget(caption_label)
+                box.addWidget(widget)
+                row.addLayout(box, 1)
+            root.addLayout(row)
+
+        pair(('Zihinsel yorgunluk · önce /10', rating('fatigue_before', 'Görev öncesi zihinsel yorgunluk')),
+             ('Zihinsel yorgunluk · sonra /10', rating('fatigue_after', 'Görev sonrası zihinsel yorgunluk')))
+        self.error = label('', 'error', True)
+        self.error.hide()
+        root.addWidget(self.error)
+        pair(('Son gece uyku', number('sleep_hours', 'Son gece uyku süresi', 24, ' saat', 1)),
+             ('Uykululuk /10', rating('sleepiness', 'Uykululuk')))
+        pair(('Algılanan stres /10', rating('stress', 'Algılanan stres')),
+             ('Fiziksel yorgunluk /10', rating('physical_fatigue', 'Fiziksel yorgunluk')))
+        study_duration = StudyDuration(self.original.get('study_minutes'))
+        self.fields['study_minutes'] = study_duration
+        pair(('Görev zorluğu /10', rating('task_difficulty', 'Görev zorluğu')),
+             ('Çalışma süresi', study_duration))
+        def yes_no(key, title):
+            widget = QComboBox()
+            for text, value in [('Belirtilmedi', None), ('Hayır', False), ('Evet', True)]:
+                widget.addItem(text, value)
+            value = self.original.get(key)
+            if isinstance(value, str):
+                value = {'True': True, 'False': False}.get(value)
+            widget.setCurrentIndex(max(0, widget.findData(value)))
+            widget.setAccessibleName(title)
             self.fields[key] = widget
-            form.addRow(title, widget)
-
-        kinds = ['Ders öncesi', 'Ders sonrası', 'Sabah', 'Gece', 'Diğer']
-        choice(basic, 'kind', 'Ölçüm', [(x, x) for x in kinds], 'Ders öncesi')
-        choice(basic, 'fatigue', 'Zihinsel yorgunluk *', [(f'{i} / 10', i) for i in range(1, 11)])
-        hint = QLabel('1: çok düşük   ·   10: çok yüksek')
-        hint.setStyleSheet('color:#93a5bd; font-size:12px;')
-        basic.addRow('', hint)
-        number(basic, 'sleep_hours', 'Son gece uyku', 24, ' saat')
-        number(basic, 'study_minutes', 'Çalışma süresi', 1440, ' dk')
-        choice(basic, 'difficulty', 'Görev zorluğu', [('Belirtilmedi', None)] + [(f'{i} / 10', i) for i in range(1, 11)])
-        text(basic, 'pair_id', 'Önce / sonra kodu', datetime.now().strftime('%Y-%m-%d') + '-1')
-        self.fields['pair_id'].setToolTip('Aynı çalışma oturumunun önce ve sonrası için aynı kodu kullanın.')
-
-        toggle = QPushButton('Ek bilgiler')
-        toggle.setCheckable(True)
-        layout.addWidget(toggle)
-        extra = QWidget()
-        details = QFormLayout(extra)
-        details.setContentsMargins(0, 0, 0, 0)
-        text(details, 'task', 'Ders / görev')
-        choice(details, 'stress', 'Algılanan stres', [('Belirtilmedi', None)] + [(f'{i} / 10', i) for i in range(1, 11)])
-        choice(details, 'posture', 'Ölçüm duruşu', [('Belirtilmedi', None)] + [(x, x) for x in ['Oturarak', 'Uzanarak', 'Ayakta']])
-        number(details, 'rest_minutes', 'Önceki dinlenme', 120, ' dk')
-        for key, title in [('caffeine', 'Son 4 saatte kafein'), ('exercise', 'Son 2 saatte egzersiz')]:
-            choice(details, key, title, [('Belirtilmedi', None), ('Hayır', False), ('Evet', True)])
-        text(details, 'notes', 'Not')
-        layout.addWidget(extra)
-        extra.hide()
-        toggle.toggled.connect(extra.setVisible)
+            return widget
+        pair(('Son 4 saatte kafein', yes_no('caffeine', 'Son 4 saatte kafein')),
+             ('Son 2 saatte egzersiz', yes_no('exercise', 'Son 2 saatte egzersiz')))
+        note_label = label('Ölçümü etkileyen durum / kısa not', 'muted')
+        notes = QPlainTextEdit(str(self.original.get('note') or ''))
+        notes.setFixedHeight(48)
+        notes.setAccessibleName('Ölçüm notu')
+        note_label.setBuddy(notes)
+        root.addWidget(note_label)
+        root.addWidget(notes)
+        self.fields['note'] = notes
+        root.addWidget(label('Puanlar öz değerlendirmedir. Bilinmeyen alanları boş bırakın.', 'muted', True))
+        root.addStretch()
+        for key in ('phase', 'fatigue_before', 'fatigue_after'):
+            self.fields[key].currentIndexChanged.connect(lambda *_: self.error.hide())
 
     def values(self):
-        result = dict(self.original)
+        result = {key: self.original.get(key) for key in LABEL_KEYS}
         for key, widget in self.fields.items():
             if isinstance(widget, QComboBox):
                 result[key] = widget.currentData()
+            elif isinstance(widget, StudyDuration):
+                result[key] = widget.value()
             elif isinstance(widget, QDoubleSpinBox):
                 result[key] = widget.value() if widget.value() >= 0 else None
             else:
-                result[key] = widget.text().strip()
-        if result['fatigue'] is None:
-            raise ValueError('Zihinsel yorgunluk puanını seçin.')
+                result[key] = widget.toPlainText().strip()
+        selected = 'fatigue_before' if result['phase'] == 'before' else 'fatigue_after'
+        if result[selected] is None:
+            self.error.setText('Seçilen aşamaya ait zihinsel yorgunluk puanını girin.')
+            self.error.show()
+            self.fields[selected].setFocus()
+            raise ValueError(self.error.text())
+        result['mental_fatigue'] = result[selected]
+        result['task_id'] = self.task_id
+        result['label_time'] = result.get('label_time') or now()
+        result['labels_updated_at'] = now()
         return result
 
 
-class Window(QMainWindow):
-    def __init__(self, data_root=None):
+class Traces(QFrame):
+    def __init__(self, live=True):
         super().__init__()
-        # Explicit font loading also supports headless Windows render checks.
-        font_path = Path('C:/Windows/Fonts/segoeui.ttf')
-        if font_path.exists():
-            QFontDatabase.addApplicationFont(str(font_path))
-        self.setWindowTitle('PPG Laboratuvarı • Zihinsel Yorgunluk Araştırması')
-        self.resize(1280, 850)
-        if data_root is None and CONFIG.exists():
-            try:
-                data_root = json.loads(CONFIG.read_text(encoding='utf-8')).get('folder')
-            except (ValueError, OSError):
-                pass
-        self.store = Storage(data_root)
+        self.setObjectName('panel')
+        self.live = live
+        self.samples = []
+        self.result = None
+        self.frozen = False
+        self.last_drawn = None
+        box = QVBoxLayout(self)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(4)
+        tools = QHBoxLayout()
+        tools.addWidget(label('PPG SİNYALİ', 'heading'), 1)
+        self.mode = QComboBox()
+        self.mode.addItems(['Nabız bileşeni · 0,5–4 Hz', 'Ham RED / IR'])
+        self.mode.setAccessibleName('Grafik görünümü')
+        tools.addWidget(self.mode)
+        self.window = QComboBox()
+        for text, seconds in [('10 sn', 10), ('15 sn', 15), ('30 sn', 30), ('60 sn', 60)]:
+            self.window.addItem(text, seconds)
+        if not live:
+            self.window.addItem('Tüm kayıt', None)
+        self.window.setCurrentIndex(1 if live else 4)
+        self.window.setAccessibleName('Grafik zaman penceresi')
+        tools.addWidget(self.window)
+        self.pause = button('Dondur', self.toggle_pause)
+        self.pause.setCheckable(True)
+        self.pause.setVisible(live)
+        tools.addWidget(self.pause)
+        tools.addWidget(button('Sığdır', self.fit))
+        box.addLayout(tools)
+        self.ir_plot = self.plot('IR', '#89d2c3')
+        self.red_plot = self.plot('RED', '#dfb980')
+        self.red_plot.setXLink(self.ir_plot)
+        self.ir_curve = self.ir_plot.plot(pen=pg.mkPen('#89d2c3', width=1.6))
+        self.red_curve = self.red_plot.plot(pen=pg.mkPen('#dfb980', width=1.5))
+        box.addWidget(self.ir_plot, 2)
+        box.addWidget(self.red_plot, 2)
+        self.ibi_plot = self.plot('IBI', '#b2bdcf', 'ms')
+        self.ibi_plot.setToolTip('Kabul edilmiş atımlar arası süreler · PPG tabanlı PRV')
+        self.ibi_curve = self.ibi_plot.plot(pen=None, symbol='o', symbolSize=4,
+                                          symbolBrush='#b2bdcf', symbolPen=None)
+        box.addWidget(self.ibi_plot, 1)
+        self.caption = label('Sinyal bekleniyor · Grafik filtresi ham CSV verisini değiştirmez.', 'muted')
+        box.addWidget(self.caption)
+        self.mode.currentIndexChanged.connect(self.redraw)
+        self.window.currentIndexChanged.connect(self.redraw)
+
+    @staticmethod
+    def plot(title, color, units='ADC'):
+        widget = pg.PlotWidget(background='#11191f')
+        widget.setMinimumHeight(65)
+        widget.setMenuEnabled(False)
+        widget.setMouseEnabled(x=True, y=True)
+        widget.showGrid(x=True, y=True, alpha=.10)
+        for name in ('left', 'bottom'):
+            axis = widget.getAxis(name)
+            axis.setPen('#394953')
+            axis.setTextPen('#9eb0bb')
+            axis.enableAutoSIPrefix(False)
+        widget.setLabel('left', title, units=units, color=color)
+        widget.setLabel('bottom', 'Zaman', units='s', color='#9eb0bb')
+        widget.getAxis('left').setWidth(65)
+        return widget
+
+    def sizeHint(self):
+        from PySide6.QtCore import QSize
+        return QSize(600, 380)
+
+    def set_samples(self, samples, result=None):
+        self.samples = list(samples)
+        if result is not None:
+            self.set_result(result, samples)
+        if not self.frozen:
+            self.redraw()
+
+    def set_result(self, result, samples):
+        self.result = result
+        peaks = result[1]
+        self.ibi_times = np.asarray([s[1] for s in samples], dtype=float)[peaks[1:]] / 1000 if len(peaks) > 1 else np.array([])
+
+    def redraw(self, *_):
+        if self.frozen:
+            return
+        samples = self.samples
+        seconds = self.window.currentData()
+        if samples and seconds is not None:
+            cutoff = samples[-1][1] - seconds * 1000
+            samples = [s for s in samples if s[1] >= cutoff]
+        view = signal_data(samples)
+        self.last_drawn = view
+        if view is None:
+            self.ir_curve.clear()
+            self.red_curve.clear()
+            self.ibi_curve.clear()
+            self.caption.setText('Sinyal bekleniyor · Ham veri değiştirilmez.')
+            return
+        t = view['t'].copy()
+        if self.live:
+            t -= t[-1]
+        else:
+            t += (samples[0][1] - self.samples[0][1]) / 1000
+        values = view['filtered'].copy() if self.mode.currentIndex() == 0 else view['raw'].copy()
+        for offset, index in enumerate(view['breaks']):
+            t = np.insert(t, index + offset, np.nan)
+            values = np.insert(values, index + offset, np.nan, axis=0)
+        self.ir_curve.setData(t, values[:, 1], connect='finite')
+        self.red_curve.setData(t, values[:, 0], connect='finite')
+        self.caption.setText('IR ve RED ayrı ölçeklerde · Ham veri korunur' +
+                             (f" · {len(view['breaks'])} kesinti" if len(view['breaks']) else ''))
+        if self.result:
+            features, peaks, ibis, accepted = self.result
+            if len(peaks) > 1 and len(accepted) == len(ibis):
+                if self.samples:
+                    origin = self.samples[-1][1] / 1000 if self.live else self.samples[0][1] / 1000
+                    self.ibi_curve.setData((self.ibi_times - origin)[accepted], ibis[accepted])
+            else:
+                self.ibi_curve.clear()
+
+    def toggle_pause(self):
+        self.frozen = self.pause.isChecked()
+        self.pause.setText('Sürdür' if self.frozen else 'Dondur')
+        self.mode.setEnabled(not self.frozen)
+        self.window.setEnabled(not self.frozen)
+        if self.frozen:
+            self.caption.setText('Görüntü donduruldu · Veri alımı ve kayıt sürüyor.')
+        else:
+            self.redraw()
+
+    def fit(self):
+        for plot in (self.ir_plot, self.red_plot, self.ibi_plot):
+            plot.enableAutoRange()
+
+
+class Window(QMainWindow):
+    def __init__(self, root=None):
+        super().__init__()
+        for font_name in ('segoeui.ttf', 'consola.ttf'):
+            path = Path('C:/Windows/Fonts') / font_name
+            if path.exists():
+                QFontDatabase.addApplicationFont(str(path))
+        QApplication.instance().setFont(QFont('Segoe UI', 9))
+        self.store = CsvStore(root or ROOT / 'kayitlar')
         self.worker = None
-        self.live = deque(maxlen=6500)
-        self.recording = False
+        self.buffer = deque(maxlen=6500)
         self.pending = None
-        self.last_sample_at = 0
-        self.last_seq = None
+        self.recording = False
+        self.last_seen = 0
+        self.sequence = None
+        self.last_ms = None
+        self.gaps = 0
+        self.total = 0
+        self.counter = 0
+        self.active_record = None
+        self.latest_analysis = None
+        self.setWindowTitle('PPG · Ölçüm ve etiketleme')
+        self.setMinimumSize(1100, 700)
+        self.resize(1366, 768)
         self.setStyleSheet(STYLE)
-        root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 18, 24, 18)
-        title = QLabel('PPG Laboratuvarı')
-        title.setObjectName('title')
-        layout.addWidget(title)
-        folder_bar = QHBoxLayout()
-        self.folder_label = QLabel(str(self.store.root.resolve()))
-        self.folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.folder_label.setWordWrap(True)
-        folder_bar.addWidget(QLabel('Kayıt klasörü:'))
-        folder_bar.addWidget(self.folder_label, 1)
-        folder_bar.addWidget(button('Klasörü aç', self.open_folder))
-        self.folder_btn = button('Değiştir', self.choose_folder)
-        folder_bar.addWidget(self.folder_btn)
-        layout.addLayout(folder_bar)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
-        self.build_live()
-        self.build_history()
-        self.status = QLabel('Hazır • Önce COM portuna bağlanın veya demo modunu açın.')
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self.setCentralWidget(root)
+        self.build()
         self.refresh_ports()
-        self.refresh_history()
+        self.refresh_records()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(100)
-        self.analysis_counter = 0
+        self.timer.start(200)
 
-    def build_live(self):
+    def build(self):
+        root = QWidget()
+        root.setObjectName('workspace')
+        box = QVBoxLayout(root)
+        box.setContentsMargins(12, 6, 12, 8)
+        box.setSpacing(7)
+        header = QHBoxLayout()
+        header.addWidget(label('PPG / Ölçüm', 'brand'))
+        self.connection_state = label('Bağlantı kapalı', 'status')
+        header.addWidget(self.connection_state)
+        header.addStretch()
+        header.addWidget(button('CSV klasörü', self.open_folder))
+        box.addLayout(header)
+        self.tabs = QTabWidget()
+        self.live_page()
+        self.archive_page()
+        box.addWidget(self.tabs, 1)
+        self.status = label('ESP32 USB bağlantısını seçin · Kayıtlar yalnızca bu bilgisayarda saklanır.', 'muted')
+        box.addWidget(self.status)
+        self.setCentralWidget(root)
+
+    def live_page(self):
         page = QWidget()
         outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 5, 0, 0)
+        outer.setSpacing(7)
         connection = QHBoxLayout()
+        connection.addWidget(label('ESP32 USB', 'muted'))
         self.port = QComboBox()
-        self.port.setMinimumWidth(260)
-        connection.addWidget(self.port)
-        self.refresh_btn = button('Portları yenile', self.refresh_ports)
-        connection.addWidget(self.refresh_btn)
-        self.connect_btn = button('Bağlan', self.toggle_connection, True)
-        connection.addWidget(self.connect_btn)
-        self.demo_btn = button('Demo başlat', self.start_demo)
-        connection.addWidget(self.demo_btn)
-        connection.addStretch()
-        self.mode = QLabel('BAĞLANTI YOK')
-        connection.addWidget(self.mode)
+        self.port.setMinimumWidth(160)
+        self.port.setMaximumWidth(350)
+        self.port.setAccessibleName('COM portu')
+        connection.addWidget(self.port, 1)
+        self.baud = QComboBox()
+        self.baud.addItems(['115200', '230400', '460800', '921600'])
+        self.baud.setAccessibleName('Baud hızı')
+        connection.addWidget(self.baud)
+        self.refresh_btn = button('Yenile', self.refresh_ports)
+        self.connect_btn = button('Bağlan', self.toggle_connection)
+        self.demo_btn = button('Demo', self.start_demo)
+        for control in (self.refresh_btn, self.connect_btn, self.demo_btn):
+            connection.addWidget(control)
+        self.flow = label('Veri bekleniyor', 'muted')
+        connection.addWidget(self.flow, 1, Qt.AlignmentFlag.AlignRight)
         outer.addLayout(connection)
-        content = QHBoxLayout()
-        self.form_box = QGroupBox('Ölçüm bilgileri')
-        self.form_box.setFixedWidth(360)
-        form_container = QVBoxLayout(self.form_box)
-        form_scroll = QScrollArea()
-        form_scroll.setWidgetResizable(True)
-        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        form_content = QWidget()
-        form = QVBoxLayout(form_content)
-        form.setContentsMargins(0, 0, 0, 0)
-        form_scroll.setWidget(form_content)
-        form_container.addWidget(form_scroll)
-        self.label_form = LabelForm()
-        form.addWidget(self.label_form)
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        monitor = QVBoxLayout()
+        monitor.setSpacing(5)
+        values = QHBoxLayout()
+        values.setSpacing(8)
+        self.metric_values = {}
+        for key, title in [('bpm', 'Nabız · BPM'), ('quality', 'Sinyal kontrolü · %'),
+                           ('prv_rmssd_ms', 'PRV · RMSSD / ms'), ('prv_sdnn_ms', 'PRV · SDNN / ms')]:
+            card = QFrame()
+            card.setObjectName('metric')
+            card_box = QVBoxLayout(card)
+            card_box.setContentsMargins(10, 6, 10, 6)
+            card_box.setSpacing(1)
+            card_box.addWidget(label(title, 'muted'))
+            value = label('—', 'value')
+            value.setAccessibleName(title)
+            card_box.addWidget(value)
+            self.metric_values[key] = value
+            values.addWidget(card, 1)
+        monitor.addLayout(values)
+        self.signal_status = label('Nabız için 15 sn, PRV için en az 60 sn kabul edilmiş sinyal gerekir.', 'muted')
+        self.signal_status.setWordWrap(True)
+        monitor.addWidget(self.signal_status)
+        self.live_traces = Traces()
+        monitor.addWidget(self.live_traces, 1)
+        body.addLayout(monitor, 1)
+        self.label_panel = frame()
+        self.label_panel.setFixedWidth(365)
+        form = QVBoxLayout(self.label_panel)
+        form.setContentsMargins(10, 10, 10, 10)
+        form.setSpacing(7)
+        heading = QHBoxLayout()
+        heading.addWidget(label('Ölçüm etiketleri', 'heading'), 1)
+        self.new_task_btn = button('Yeni çalışma', self.new_task)
+        heading.addWidget(self.new_task_btn)
+        form.addLayout(heading)
+        self.labels = Labels()
+        form.addWidget(self.labels, 1)
+        duration_row = QHBoxLayout()
+        duration_row.addWidget(label('Kayıt süresi', 'muted'))
         self.duration = QComboBox()
-        for name, seconds in [('30 saniye', 30), ('1 dakika', 60), ('2 dakika', 120), ('5 dakika', 300)]:
-            self.duration.addItem(name, seconds)
-        self.duration.setCurrentIndex(3)
-        form.addWidget(QLabel('Kayıt süresi'))
-        form.addWidget(self.duration)
-        form.addStretch()
-        content.addWidget(self.form_box)
-        right = QVBoxLayout()
-        self.metrics = QLabel('Nabız: — BPM    |    Sinyal: bekleniyor    |    RMSSD: —')
-        self.metrics.setStyleSheet('font-size:16px; color:#5ce2cb; padding:10px;')
-        self.metrics.setWordWrap(True)
-        right.addWidget(self.metrics)
-        pg.setConfigOptions(antialias=True, background='#121e2e', foreground='#95a8c1')
-        self.plot = pg.PlotWidget()
-        self.plot.setLabel('left', 'Ham ADC')
-        self.plot.setLabel('bottom', 'Zaman', units='s')
-        self.plot.addLegend()
-        self.plot.showGrid(x=True, y=True, alpha=.15)
-        self.red_curve = self.plot.plot(pen=pg.mkPen('#ff6e86', width=2), name='RED')
-        self.ir_curve = self.plot.plot(pen=pg.mkPen('#52dcc5', width=2), name='IR')
-        right.addWidget(self.plot, 1)
+        for text, seconds in [('30 sn · deneme', 30), ('1 dakika', 60), ('2 dakika', 120), ('5 dakika', 300), ('10 dakika', 600)]:
+            self.duration.addItem(text, seconds)
+        self.duration.setCurrentIndex(2)
+        self.duration.setAccessibleName('Kayıt süresi')
+        duration_row.addWidget(self.duration, 1)
+        form.addLayout(duration_row)
+        body.addWidget(self.label_panel)
+        outer.addLayout(body, 1)
         self.progress = QProgressBar()
-        right.addWidget(self.progress)
+        self.progress.setTextVisible(False)
+        self.progress.setValue(0)
+        outer.addWidget(self.progress)
         controls = QHBoxLayout()
-        self.record_btn = button('●  Kaydı başlat', self.start_record, True)
+        self.record_status = label('Kayda hazır', 'muted')
+        controls.addWidget(self.record_status, 1)
+        self.record_btn = button('Kaydı başlat', self.start_record, 'primary')
         self.stop_btn = button('Durdur', self.stop_record)
-        self.save_btn = button('Kaydı kaydet', self.save_record)
-        self.discard_btn = button('Kaydı sil', self.discard_record)
-        self.stop_btn.setEnabled(False); self.save_btn.setEnabled(False); self.discard_btn.setEnabled(False)
-        for b in [self.record_btn, self.stop_btn, self.save_btn, self.discard_btn]: controls.addWidget(b)
-        right.addLayout(controls)
-        content.addLayout(right, 1)
-        outer.addLayout(content, 1)
-        self.tabs.addTab(page, 'Canlı ölçüm')
+        self.save_btn = button('CSV kaydet', self.save_record)
+        self.discard_btn = button('Vazgeç', self.discard_record, 'danger')
+        for control in (self.record_btn, self.stop_btn, self.save_btn, self.discard_btn):
+            controls.addWidget(control)
+        self.stop_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.discard_btn.setEnabled(False)
+        outer.addLayout(controls)
+        self.tabs.addTab(page, 'Canlı izleme')
 
-    def build_history(self):
+    def archive_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        actions = QHBoxLayout()
-        actions.addWidget(button('Yenile', self.refresh_history))
-        actions.addWidget(button('Veri seti dışa aktar', self.export_dataset))
-        actions.addWidget(button('Seçilen iki kaydı karşılaştır', self.compare))
-        actions.addStretch()
-        layout.addLayout(actions)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        cards = QWidget()
-        self.card_grid = QGridLayout(cards)
-        self.card_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        scroll.setWidget(cards)
-        layout.addWidget(scroll, 2)
-        self.history_plot = pg.PlotWidget()
-        self.history_plot.setLabel('bottom', 'Zaman', units='s')
-        self.history_plot.setLabel('left', 'IR')
-        layout.addWidget(self.history_plot, 1)
-        self.history_info = QLabel('')
-        self.history_info.setWordWrap(True)
-        layout.addWidget(self.history_info)
-        self.tabs.addTab(page, 'Kayıtlar')
-
-    def open_folder(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.root.resolve())))
-
-    def choose_folder(self):
-        if self.recording or self.pending:
-            self.alert('Önce ölçümü durdurup kaydedin veya silin.')
-            return
-        path = QFileDialog.getExistingDirectory(self, 'Kayıt klasörü', str(self.store.root))
-        if path:
-            self.switch_folder(path)
-
-    def switch_folder(self, path, persist=True):
-        if self.recording or self.pending:
-            return False
-        try:
-            new_store = Storage(Path(path).resolve())
-            if persist:
-                temp = CONFIG.with_suffix('.tmp')
-                temp.write_text(json.dumps({'folder': str(new_store.root)}, ensure_ascii=False), encoding='utf-8')
-                temp.replace(CONFIG)
-        except Exception as e:
-            if 'new_store' in locals():
-                new_store.db.close()
-            self.alert(f'Klasör açılamadı: {e}')
-            return False
-        self.store.db.close()
-        self.store = new_store
-        self.folder_label.setText(str(self.store.root))
-        self.history_plot.clear()
-        self.history_info.clear()
-        self.refresh_history()
-        self.status.setText('Kayıt klasörü değişti. Önceki kayıtlar eski klasörde duruyor.')
-        return True
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 5, 0, 0)
+        self.archive = QStackedWidget()
+        listing = QWidget()
+        listing_box = QVBoxLayout(listing)
+        listing_box.setContentsMargins(0, 0, 0, 0)
+        tools = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('Tarih, aşama veya not ara…')
+        self.search.setAccessibleName('CSV kayıtlarını ara')
+        self.search.textChanged.connect(self.filter_records)
+        tools.addWidget(self.search, 1)
+        tools.addWidget(button('Yenile', self.refresh_records))
+        self.open_btn = button('Sinyali incele', self.open_selected)
+        tools.addWidget(self.open_btn)
+        listing_box.addLayout(tools)
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(['TARİH / SAAT', 'AŞAMA', 'ÖNCE /10', 'SONRA /10', 'SÜRE · sn', 'KAYNAK', 'KALİTE · %', 'CSV DOSYASI'])
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self.update_selection)
+        self.table.itemDoubleClicked.connect(lambda *_: self.open_selected())
+        listing_box.addWidget(self.table, 1)
+        self.archive_summary = label('Henüz CSV kaydı yok.', 'muted')
+        listing_box.addWidget(self.archive_summary)
+        self.archive.addWidget(listing)
+        detail = QWidget()
+        detail_box = QVBoxLayout(detail)
+        detail_box.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.addWidget(button('Kayıtlara dön', lambda: self.archive.setCurrentIndex(0)))
+        self.detail_title = label('Kayıt inceleme', 'heading')
+        bar.addWidget(self.detail_title, 1)
+        bar.addWidget(button('Etiketleri düzenle', self.edit_record))
+        detail_box.addLayout(bar)
+        self.detail_info = label('', 'muted', True)
+        detail_box.addWidget(self.detail_info)
+        self.history_traces = Traces(live=False)
+        detail_box.addWidget(self.history_traces, 1)
+        self.archive.addWidget(detail)
+        outer.addWidget(self.archive, 1)
+        self.tabs.addTab(page, 'CSV kayıtları')
 
     def refresh_ports(self):
+        previous = self.port.currentData()
         self.port.clear()
-        for p in list_ports.comports():
-            self.port.addItem(f'{p.device} — {p.description}', p.device)
+        ports = sorted(list_ports.comports(), key=lambda p: p.vid is None)
+        for port in ports:
+            self.port.addItem(f'{port.device} · {port.description}', port.device)
+        if not ports:
+            self.port.addItem('USB / COM portu bulunamadı', None)
+        if previous and self.port.findData(previous) >= 0:
+            self.port.setCurrentIndex(self.port.findData(previous))
 
     def toggle_connection(self):
         if self.worker:
@@ -523,254 +609,317 @@ class Window(QMainWindow):
         elif self.port.currentData():
             self.start_source(self.port.currentData())
         else:
-            self.alert('COM portu bulunamadı. USB veri kablosunu ve Aygıt Yöneticisi’ni kontrol edin.')
+            self.status.setText('COM portu bulunamadı. USB kablosunu kontrol edip Yenile deyin.')
 
     def start_demo(self):
-        if not self.worker: self.start_source(None)
+        if not self.worker:
+            self.start_source(None)
 
     def start_source(self, port):
-        self.live.clear(); self.last_seq = None; self.last_sample_at = 0
+        self.buffer.clear()
+        self.last_seen = 0
+        self.sequence = self.last_ms = None
+        self.gaps = self.total = 0
+        self.latest_analysis = None
+        self.live_traces.pause.setChecked(False)
+        self.live_traces.toggle_pause()
+        self.live_traces.result = None
+        self.live_traces.set_samples([])
+        self.clear_metrics('Sinyal bekleniyor')
         self.source = port or 'DEMO'
-        self.worker = Acquisition(port)
-        self.worker.batch.connect(self.receive)
+        self.worker = Acquisition(port, int(self.baud.currentText()))
+        self.worker.samples.connect(self.receive)
         self.worker.message.connect(self.status.setText)
         self.worker.finished.connect(self.source_finished)
         self.worker.start()
         self.connect_btn.setText('Bağlantıyı kes')
-        self.demo_btn.setEnabled(False); self.port.setEnabled(False); self.refresh_btn.setEnabled(False)
-        self.mode.setText('DEMO • SENTETİK VERİ' if not port else f'CİHAZ • {port}')
+        for control in (self.port, self.baud, self.refresh_btn, self.demo_btn):
+            control.setEnabled(False)
+        self.connection_state.setText('DEMO · SENTETİK' if port is None else f'{port} · Bağlanıyor')
 
     def disconnect(self):
-        if self.recording: self.stop_record()
+        if self.recording:
+            self.stop_record()
         if self.worker:
             self.worker.requestInterruption()
             self.worker.wait(1500)
 
     def source_finished(self):
-        if self.recording: self.stop_record()
+        if self.sender() is not self.worker:
+            return
+        if self.recording:
+            self.stop_record()
         self.worker = None
+        self.last_seen = 0
         self.connect_btn.setText('Bağlan')
-        self.demo_btn.setEnabled(True); self.port.setEnabled(True); self.refresh_btn.setEnabled(True)
-        self.mode.setText('BAĞLANTI KAPALI')
+        for control in (self.port, self.baud, self.refresh_btn, self.demo_btn):
+            control.setEnabled(True)
+        self.connection_state.setText('Bağlantı kapalı')
+        self.clear_metrics('Akış kapalı · Son sinyal grafikte korunuyor')
 
     def receive(self, samples):
-        for s in samples:
-            if self.last_seq is not None and s[0] <= self.last_seq:
+        if not samples:
+            return
+        for sample in samples:
+            seq, ms, _, _ = sample
+            reset = self.sequence is not None and (seq <= self.sequence or ms <= self.last_ms)
+            if reset:
                 if self.recording:
                     self.stop_record()
-                    self.status.setText('Cihaz sırası sıfırlandı; kayıt durduruldu. Kısmi kaydı inceleyin.')
-                self.live.clear()
-            elif self.last_seq is not None and s[0] != self.last_seq + 1:
-                self.live.clear()
-                self.status.setText('Örnek kesintisi algılandı; canlı analiz yeniden başlıyor.')
-            self.last_seq = s[0]
-            self.live.append(s)
+                self.buffer.clear()
+                self.latest_analysis = None
+                self.live_traces.result = None
+                self.live_traces.ibi_curve.clear()
+                self.gaps += 1
+                self.clear_metrics('Cihaz saati/sırası sıfırlandı · Yeni akış')
+            elif self.sequence is not None and (seq != self.sequence + 1 or ms - self.last_ms > 50):
+                self.gaps += 1
+                self.clear_metrics('Veri kesintisi algılandı')
+            self.buffer.append(sample)
+            self.sequence, self.last_ms = seq, ms
+            self.total += 1
             if self.recording:
-                if self.record_start_ms is None: self.record_start_ms = s[1]
-                if s[1] - self.record_start_ms < self.target_seconds * 1000:
-                    self.record_samples.append(s)
+                if self.record_start_ms is None:
+                    self.record_start_ms = ms
+                if ms - self.record_start_ms < self.target * 1000:
+                    self.record_samples.append(sample)
                 else:
+                    self.progress.setValue(100)
                     self.stop_record()
-        self.last_sample_at = time.monotonic()
+        self.last_seen = time.monotonic()
 
-    def labels(self):
-        return self.label_form.values()
+    def clear_metrics(self, text):
+        for value in self.metric_values.values():
+            value.setText('—')
+        self.signal_status.setText(text)
+
+    def tick(self):
+        self.counter += 1
+        age = time.monotonic() - self.last_seen if self.last_seen else None
+        if self.worker:
+            source = 'DEMO · SENTETİK' if self.source == 'DEMO' else self.source
+            self.connection_state.setText(source + (' · Veri alınıyor' if age is not None and age < 2 else ' · Veri bekleniyor'))
+        self.flow.setText(f"{self.total:,} örnek · {self.gaps} kesinti · Son veri {age:.1f} sn" if age is not None else 'Veri bekleniyor')
+        if age is None or age > 2:
+            self.clear_metrics('Güncel veri yok · Sinyal ve USB bağlantısını kontrol edin')
+        elif self.counter % 10 == 0 and self.buffer:
+            snapshot = list(self.buffer)
+            live = analyze(snapshot[-2000:])
+            full = analyze(snapshot)
+            features = dict(live[0])
+            features['prv_rmssd_ms'] = full[0]['prv_rmssd_ms']
+            features['prv_sdnn_ms'] = full[0]['prv_sdnn_ms']
+            for key, widget in self.metric_values.items():
+                widget.setText(display(features[key]))
+            status = features['analysis_status'].split(' · PRV için')[0]
+            if full[0]['prv_rmssd_ms'] is not None:
+                status += f" · PRV: son {full[0]['duration_s']:.0f} sn"
+            elif features['bpm'] is not None:
+                status += ' · PRV için 60 sn kesintisiz, kabul edilmiş veri bekleniyor'
+            self.signal_status.setText(status)
+            self.latest_analysis = full
+            self.live_traces.set_result(full, snapshot)
+        if self.tabs.currentIndex() == 0:
+            self.live_traces.set_samples(list(self.buffer))
+        if self.recording:
+            elapsed = (self.record_samples[-1][1] - self.record_start_ms) / 1000 if self.record_samples else 0
+            self.progress.setValue(min(100, int(100 * elapsed / self.target)))
+            self.record_status.setText(f'Kayıt · {elapsed:.1f} / {self.target} sn · {len(self.record_samples):,} örnek')
+            if age is None or age > 3:
+                self.stop_record()
+                self.status.setText('Veri akışı kesildi. Kısmi ölçümü kaydedebilir veya vazgeçebilirsiniz.')
 
     def start_record(self):
         if self.pending:
-            self.alert('Önce bekleyen kaydı kaydedin veya silin.'); return
-        if not self.worker or time.monotonic() - self.last_sample_at > 2:
-            self.alert('Kayıt için önce canlı PPG verisi alınmalı.'); return
-        try:
-            self.record_labels = self.labels()
-        except ValueError as e:
-            self.alert(str(e))
+            self.status.setText('Önce bekleyen kaydı kaydedin veya Vazgeç deyin.')
             return
-        self.record_created = datetime.now().astimezone().isoformat(timespec='seconds')
+        if not self.worker or not self.last_seen or time.monotonic() - self.last_seen > 2:
+            self.status.setText('Kayda başlamak için önce canlı sensör veya demo verisi alın.')
+            return
+        try:
+            self.start_labels = self.labels.values()
+        except ValueError as e:
+            self.status.setText(str(e))
+            return
+        self.created = now()
         self.record_source = self.source
-        self.target_seconds = self.duration.currentData()
-        self.record_start_ms = None; self.record_samples = []; self.recording = True
+        self.record_baud = int(self.baud.currentText())
+        self.target = self.duration.currentData()
+        self.record_start_ms = None
+        self.record_samples = []
+        self.recording = True
+        self.label_panel.setEnabled(False)
+        self.record_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self.progress.setValue(0)
-        self.form_box.setEnabled(False); self.record_btn.setEnabled(False); self.stop_btn.setEnabled(True)
-        self.status.setText('Kayıt sürüyor. Parmağınızı sabit tutun.')
+        self.status.setText('Ölçüm kaydediliyor · Parmağınızı sabit tutun.')
 
     def stop_record(self):
-        if not self.recording: return
+        if not self.recording:
+            return
         self.recording = False
-        if self.record_samples:
-            self.pending = (self.record_samples, self.record_labels, self.record_source)
-            self.save_btn.setEnabled(True); self.discard_btn.setEnabled(True)
-        self.form_box.setEnabled(True); self.record_btn.setEnabled(True); self.stop_btn.setEnabled(False)
-        self.status.setText(f'Kayıt durdu: {len(self.record_samples)} örnek. Kaydet düğmesine basın.')
+        self.pending = list(self.record_samples) if self.record_samples else None
+        self.label_panel.setEnabled(True)
+        self.new_task_btn.setEnabled(not bool(self.pending))
+        self.stop_btn.setEnabled(False)
+        self.save_btn.setEnabled(bool(self.pending))
+        self.discard_btn.setEnabled(bool(self.pending))
+        self.record_btn.setEnabled(not bool(self.pending))
+        self.record_status.setText(f'Kaydetmeyi bekliyor · {len(self.record_samples):,} örnek')
+        self.status.setText('Ölçüm durdu. Etiketleri kontrol edip CSV kaydet deyin.')
 
     def save_record(self):
-        if not self.pending: return
-        samples, labels, source = self.pending
+        if not self.pending:
+            return
         try:
-            features = analyze(samples)
-            features['requested_duration_s'] = self.target_seconds
-            features['complete'] = len(samples) >= self.target_seconds * 100 * .98 and features['gaps'] == 0
-            sid = self.store.save(samples, labels, features, source, self.record_created)
-            self.discard_record(); self.refresh_history()
-            self.status.setText(f'Kayıt kaydedildi • {sid} • {len(samples)} örnek')
-        except Exception as e: self.alert(f'Kaydedilemedi: {e}')
+            labels = self.labels.values()
+            labels['label_time'] = self.start_labels['label_time']
+            path = self.store.save(self.pending, labels, self.record_source, self.target, self.created, self.record_baud)
+            self.clear_pending()
+            self.refresh_records()
+            self.status.setText(f'CSV kaydedildi · {path.name}')
+        except ValueError as e:
+            self.status.setText(str(e))
+        except Exception as e:
+            self.alert(f'CSV kaydedilemedi. Ölçüm bellekte korunuyor.\n{e}')
+
+    def clear_pending(self):
+        self.pending = None
+        self.save_btn.setEnabled(False)
+        self.discard_btn.setEnabled(False)
+        self.record_btn.setEnabled(True)
+        self.new_task_btn.setEnabled(True)
+        self.progress.setValue(0)
+        self.record_status.setText('Kayda hazır')
 
     def discard_record(self):
-        self.pending = None
-        self.save_btn.setEnabled(False); self.discard_btn.setEnabled(False)
+        if self.pending and QMessageBox.question(self, 'Kaydedilmemiş ölçüm', 'Bu ölçüm kaydedilmeden silinsin mi?') != QMessageBox.StandardButton.Yes:
+            return
+        self.clear_pending()
 
-    def tick(self):
-        self.analysis_counter += 1
-        if self.live:
-            data = np.array(list(self.live)[-1500:])
-            t = (data[:, 1] - data[-1, 1]) / 1000
-            self.red_curve.setData(t, data[:, 2]); self.ir_curve.setData(t, data[:, 3])
-            if self.analysis_counter % 20 == 0:
-                if time.monotonic() - self.last_sample_at > 2:
-                    self.metrics.setText('Veri akışı kesildi • Son değerler güncel değil')
-                else:
-                    f = analyze_live(list(self.live))
-                    self.metrics.setText(f"Nabız: {f['bpm'] or '—'} BPM  |  Kalite: %{f['quality']}  |  RMSSD: {f['rmssd_ms'] or '—'} ms\n{f['status']}")
-        if self.recording:
-            elapsed = (self.record_samples[-1][1] - self.record_start_ms) / 1000 if self.record_samples else 0
-            self.progress.setValue(min(100, int(100 * elapsed / self.target_seconds)))
-            self.progress.setFormat(f'{elapsed:.1f} / {self.target_seconds} saniye')
-            if time.monotonic() - self.last_sample_at > 3:
-                self.stop_record()
-                self.status.setText('Veri akışı kesildi. Kısmi kayıt durduruldu; kaydedebilir veya silebilirsiniz.')
+    def new_task(self):
+        if self.recording or self.pending:
+            return
+        self.labels.task_id = uuid.uuid4().hex[:10]
+        self.labels.original = {}
+        for key in ('fatigue_before', 'fatigue_after'):
+            self.labels.fields[key].setCurrentIndex(0)
+        self.labels.fields['phase'].setCurrentIndex(0)
+        self.status.setText('Yeni çalışma açıldı · Önce ve sonra kayıtları aynı çalışmaya bağlanacak.')
 
-    def refresh_history(self):
-        self.rows = self.store.sessions()
-        while self.card_grid.count():
-            item = self.card_grid.takeAt(0)
-            if item.widget():
-                item.widget().hide()
-                item.widget().deleteLater()
-        self.card_checks = {}
-        if not self.rows:
-            self.card_grid.addWidget(QLabel('Henüz kayıt yok.'), 0, 0)
-        for i, row in enumerate(self.rows):
-            labels = json.loads(row['labels'])
-            features = json.loads(row['features'])
-            card = QFrame()
-            card.setObjectName('card')
-            card.setFixedSize(285, 235)
-            box = QVBoxLayout(card)
-            date = datetime.fromisoformat(row['created']).strftime('%d.%m.%Y  •  %H:%M')
-            check = QCheckBox(date)
-            self.card_checks[row['id']] = check
-            box.addWidget(check)
-            box.addWidget(QLabel(labels.get('kind', 'Ölçüm')))
-            box.addWidget(QLabel(f"Yorgunluk: {labels.get('fatigue', '—')}/10   •   {features['duration_s']:.0f} sn"))
-            bpm = features.get('bpm')
-            box.addWidget(QLabel(f"Nabız: {bpm if bpm is not None else '—'} BPM"))
-            state = 'Demo' if row['source'] == 'DEMO' else ('Tam kayıt' if features.get('complete') else 'Kısmi kayıt')
-            box.addWidget(QLabel(f"{state}  •  {labels.get('pair_id', '')}"))
-            box.addStretch()
-            actions = QHBoxLayout()
-            actions.addWidget(button('İncele', lambda checked=False, r=row: self.inspect_record(r)))
-            actions.addWidget(button('Düzenle', lambda checked=False, r=row: self.edit_record(r)))
-            actions.addWidget(button('CSV', lambda checked=False, r=row: self.export_raw(r)))
-            box.addLayout(actions)
-            self.card_grid.addWidget(card, i // 3, i % 3)
+    def refresh_records(self):
+        self.records, errors = self.store.list_records()
+        self.active_record = None
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.records))
+        for i, row in enumerate(self.records):
+            values = [row['created_at'].replace('T', ' ')[:19], measurement_name(row),
+                      row.get('fatigue_before'), row.get('fatigue_after'), row.get('duration_s'),
+                      row['source'], row.get('quality'), Path(row['path']).name]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(display(value))
+                item.setData(Qt.ItemDataRole.UserRole, i)
+                item.setToolTip(row.get('note', ''))
+                self.table.setItem(i, col, item)
+            self.table.setRowHeight(i, 38)
+        self.table.blockSignals(False)
+        self.open_btn.setEnabled(False)
+        self.filter_records()
+        self.archive_summary.setText(f'{len(self.records)} CSV kaydı · {self.store.root}' + (f' · {len(errors)} dosya okunamadı' if errors else ''))
 
-    def selected(self):
-        return [row for row in self.rows if self.card_checks[row['id']].isChecked()]
+    def filter_records(self, *_):
+        text = self.search.text().casefold().strip()
+        for i, row in enumerate(getattr(self, 'records', [])):
+            haystack = f"{row['created_at']} {row.get('note', '')} {measurement_name(row)}".casefold()
+            self.table.setRowHidden(i, bool(text and text not in haystack))
+        self.update_selection()
 
-    def inspect_record(self, row):
+    def update_selection(self):
+        row = self.table.currentRow()
+        valid = 0 <= row < len(getattr(self, 'records', [])) and not self.table.isRowHidden(row)
+        self.active_record = self.records[row] if valid else None
+        self.open_btn.setEnabled(valid)
+
+    def open_selected(self):
+        if not self.active_record:
+            return
         try:
-            data = np.array(self.store.read(row))
-            self.history_plot.clear()
-            self.history_plot.plot((data[:, 1] - data[0, 1]) / 1000, data[:, 3], pen='#52dcc5')
-            labels = json.loads(row['labels'])
-            features = json.loads(row['features'])
-            self.history_info.setText(
-                f"Uyku: {labels.get('sleep_hours', '—')} saat  •  Ders: {labels.get('study_minutes', '—')} dk  •  "
-                f"Zorluk: {labels.get('difficulty', '—')}/10\n"
-                f"RMSSD: {features.get('rmssd_ms') or '—'} ms  •  SDNN: {features.get('sdnn_ms') or '—'} ms\n"
-                f"{labels.get('notes', '')}\n{self.store.root / row['file']}")
+            samples, row = self.store.read(self.active_record['path'])
+            result = analyze(samples)
+            self.history_traces.result = None
+            self.history_traces.set_samples(samples, result)
+            self.history_traces.fit()
+            self.detail_title.setText(Path(self.active_record['path']).name)
+            self.detail_info.setText(
+                f"{row['created_at']} · {measurement_name(row, full=True)} · {row['source']} · {row['duration_s']} sn\n"
+                f"Yorgunluk önce {display(row.get('fatigue_before'))}/10 · sonra {display(row.get('fatigue_after'))}/10 · "
+                f"Nabız {display(row.get('bpm'))} BPM · RMSSD {display(row.get('prv_rmssd_ms'))} ms · SDNN {display(row.get('prv_sdnn_ms'))} ms\n"
+                f"{row['sample_count']} örnek · Eksik örnek {row['missing_samples']} · Kalite {display(row.get('quality'))}% · {row['analysis_status']}")
+            self.archive.setCurrentIndex(1)
         except Exception as e:
-            self.alert(str(e))
+            self.alert(f'Kayıt açılamadı: {e}')
 
-    def edit_record(self, row):
+    def edit_record(self):
+        if not self.active_record:
+            return
+        path = self.active_record['path']
         dialog = QDialog(self)
-        dialog.setWindowTitle('Ölçüm etiketleri')
-        dialog.setMinimumWidth(420)
-        layout = QVBoxLayout(dialog)
-        form = LabelForm(json.loads(row['labels']))
-        layout.addWidget(form)
+        dialog.setWindowTitle('CSV etiketlerini düzenle')
+        dialog.resize(420, 580)
+        box = QVBoxLayout(dialog)
+        form = Labels(self.active_record)
+        box.addWidget(form, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText('Kaydet')
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Vazgeç')
-        layout.addWidget(buttons)
+        box.addWidget(buttons)
         def save():
             try:
-                self.store.update_labels(row['id'], form.values())
+                self.store.update_labels(path, form.values())
                 dialog.accept()
+            except ValueError:
+                pass
             except Exception as e:
-                self.alert(str(e))
+                self.alert(f'CSV güncellenemedi: {e}')
         buttons.accepted.connect(save)
         buttons.rejected.connect(dialog.reject)
         if dialog.exec():
-            self.refresh_history()
-            self.history_info.clear()
-            self.status.setText('Etiketler güncellendi.')
+            self.refresh_records()
+            index = next(i for i, record in enumerate(self.records) if record['path'] == path)
+            self.table.selectRow(index)
+            self.update_selection()
+            self.open_selected()
+            self.status.setText('Etiketler CSV içinde güncellendi · Ham sinyal korundu.')
 
-    def export_raw(self, row):
-        path, _ = QFileDialog.getSaveFileName(self, 'Ham CSV kaydet', row['file'], 'CSV (*.csv)')
-        if path:
-            try:
-                original = self.store.root / row['file']
-                if Path(path).resolve() != original.resolve():
-                    shutil.copyfile(original, path)
-                self.status.setText('CSV dışa aktarıldı.')
-            except Exception as e:
-                self.alert(str(e))
-
-    def export_dataset(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Veri seti kaydet', 'ppg_dataset.csv', 'CSV (*.csv)')
-        if path:
-            try:
-                self.store.export_dataset(path); self.status.setText('Etiketli veri seti dışa aktarıldı.')
-            except Exception as e: self.alert(str(e))
-
-    def compare(self):
-        rows = self.selected()
-        if len(rows) != 2: self.alert('İki kayıt kartının tarih kutusunu işaretleyin.'); return
-        a, b = sorted(rows, key=lambda r: r['created'])
-        la, lb = json.loads(a['labels']), json.loads(b['labels'])
-        if not la['pair_id'] or la['pair_id'] != lb['pair_id']:
-            self.alert('Karşılaştırma için eşleştirme kodları aynı olmalı.'); return
-        if a['source'] != b['source']:
-            self.alert('Karşılaştırma için veri kaynakları aynı olmalı.'); return
-        fa, fb = json.loads(a['features']), json.loads(b['features'])
-        lines = [f"{la['kind']} → {lb['kind']} • {la['pair_id']}"]
-        names = {'fatigue': 'Yorgunluk', 'bpm': 'Nabız', 'rmssd_ms': 'RMSSD', 'sdnn_ms': 'SDNN'}
-        for key in names:
-            x, y = (la.get(key), lb.get(key)) if key == 'fatigue' else (fa.get(key), fb.get(key))
-            lines.append(f'{names[key]}: {x} → {y}' + (f'  (fark: {y-x:+.2f})' if x is not None and y is not None else ''))
-        self.history_info.setText('\n'.join(lines))
+    def open_folder(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.root.resolve())))
 
     def alert(self, text):
-        QMessageBox.information(self, 'PPG Laboratuvarı', text)
+        QMessageBox.information(self, 'PPG', text)
 
     def closeEvent(self, event):
         if self.recording or self.pending:
-            answer = QMessageBox.question(self, 'Kaydedilmemiş ölçüm', 'Kaydedilmemiş ölçüm var. Kaydı silerek kapatılsın mı?')
+            answer = QMessageBox.question(self, 'Kaydedilmemiş ölçüm', 'Kaydedilmemiş ölçüm var. Kaydetmeden kapatılsın mı?')
             if answer != QMessageBox.StandardButton.Yes:
-                event.ignore(); return
+                event.ignore()
+                return
         self.disconnect()
-        self.store.db.close()
+        if self.worker and self.worker.isRunning():
+            event.ignore()
+            self.status.setText('Bağlantı kapanıyor; pencereyi tekrar kapatın.')
+            return
+        self.timer.stop()
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    app.setFont(QFont('Segoe UI', 9))
+    pg.setConfigOptions(antialias=True)
     window = Window()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
-
 
 
 if __name__ == '__main__':
